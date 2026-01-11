@@ -1,0 +1,1 @@
+"""ImageNamer package."""
