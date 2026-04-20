@@ -1,34 +1,69 @@
 """
 Image processing and renaming logic.
 
-Discovers images, invokes Ollama for analysis, generates logical filenames,
-handles naming conflicts, and executes safe file renames.
+Discovers images, invokes the vision client for analysis, generates logical
+filenames, handles naming conflicts, and executes safe file renames.
+
+v2 additions:
+- progress_callback parameter for live UI updates
+- INPUT_FOLDER support via Config.INPUT_FOLDER
+- move_to_output() for optional second-phase output relocation
+- process_all() convenience wrapper used by the UI
 """
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from config import Config
 from ollama_client import OllamaClient, OllamaResponseError
 
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MoveResult:
+    """Result of a move_to_output() call."""
+    moved: int
+    skipped: int
+    errors: List[str] = field(default_factory=list)
 
 
 class ImageProcessor:
     """Handles image discovery, analysis, and renaming."""
 
-    def __init__(self, ollama_client: OllamaClient = None):
+    def __init__(
+        self,
+        ollama_client: OllamaClient = None,
+        progress_callback: Optional[Callable[[str, str], None]] = None,
+    ):
         """
         Initialize image processor.
 
         Args:
-            ollama_client: OllamaClient instance. Creates default if not provided.
+            ollama_client: Vision client instance. Creates default LlamaClient if not provided.
+            progress_callback: Optional callback invoked with (level, message) during processing.
+                               level is one of: 'info', 'success', 'warning', 'error'.
         """
         self.ollama_client = ollama_client or OllamaClient()
-        self.image_folder = Path(Config.IMAGE_FOLDER)
+        self.image_folder = Path(Config.INPUT_FOLDER)
+        self.output_folder: str = Config.OUTPUT_FOLDER
         self.supported_extensions = Config.get_supported_extensions()
+        self.progress_callback = progress_callback
+        self._renamed_files: List[Path] = []  # Paths of successfully renamed files this session
+
+    def _emit(self, level: str, message: str) -> None:
+        """Emit a progress message to the callback (if set) and the logger."""
+        if self.progress_callback:
+            self.progress_callback(level, message)
+        log_fn = {
+            "info": logger.info,
+            "success": logger.info,
+            "warning": logger.warning,
+            "error": logger.error,
+        }.get(level, logger.info)
+        log_fn(message)
 
     def discover_images(self) -> List[Path]:
         """
@@ -108,47 +143,29 @@ class ImageProcessor:
         return f"{base_filename}{file_extension}"
 
     def resolve_filename_conflict(
-        self, proposed_filename: str, existing_path: Path
+        self, proposed_filename: str, directory: Path
     ) -> str:
         """
-        Resolve filename conflicts by appending numeric suffix.
-
-        If proposed_filename already exists, appends -2, -3, etc. until unique.
-
-        Args:
-            proposed_filename: The desired filename.
-            existing_path: The directory where the file would be placed.
-
-        Returns:
-            A unique filename that does not exist in existing_path.
+        Return a unique filename in directory by appending -2, -3, ... as needed.
         """
-        target_path = existing_path / proposed_filename
+        target_path = directory / proposed_filename
 
         if not target_path.exists():
             return proposed_filename
 
-        # File exists; need to add suffix
-        stem = target_path.stem  # filename without extension
-        suffix = target_path.suffix  # extension with dot
+        stem = target_path.stem
+        suffix = target_path.suffix
 
         counter = 2
         while True:
             new_filename = f"{stem}-{counter}{suffix}"
-            new_path = existing_path / new_filename
-
-            if not new_path.exists():
-                logger.debug(
-                    f"Resolved conflict for {proposed_filename} -> {new_filename}"
-                )
+            if not (directory / new_filename).exists():
+                logger.debug(f"Resolved conflict: {proposed_filename} -> {new_filename}")
                 return new_filename
-
             counter += 1
-
-            # Safety check: prevent infinite loop
             if counter > 1000:
                 raise RuntimeError(
-                    f"Unable to resolve filename conflict for {proposed_filename} "
-                    "after 1000 attempts"
+                    f"Unable to resolve filename conflict for {proposed_filename} after 1000 attempts"
                 )
 
     def rename_image(
@@ -219,6 +236,99 @@ class ImageProcessor:
         success, rename_error = self.rename_image(image_path, final_filename, dry_run)
 
         if success:
+            if not dry_run:
+                self._renamed_files.append(image_path.parent / final_filename)
             return True, final_filename, None
         else:
             return False, None, rename_error
+
+    def process_all(self, dry_run: bool = False) -> Tuple[int, int]:
+        """
+        Discover and process all images in image_folder.
+
+        Emits progress via progress_callback. Stops early if
+        Config.MAX_CONSECUTIVE_FAILURES consecutive failures occur.
+
+        Returns:
+            Tuple of (success_count, failure_count).
+        """
+        images = self.discover_images()
+        if not images:
+            self._emit("warning", "No images found to process")
+            return 0, 0
+
+        self._emit("info", f"Found {len(images)} images to process")
+        success_count = 0
+        failure_count = 0
+        consecutive_failures = 0
+
+        for idx, image_path in enumerate(images, 1):
+            self._emit("info", f"Processing {idx}/{len(images)}: {image_path.name}")
+            success, new_filename, error = self.process_image(image_path, dry_run=dry_run)
+
+            if success:
+                success_count += 1
+                consecutive_failures = 0
+                action = "[DRY RUN] Would rename" if dry_run else "Renamed"
+                self._emit("success", f"{action}: {image_path.name} -> {new_filename}")
+            else:
+                failure_count += 1
+                consecutive_failures += 1
+                self._emit("error", f"Failed: {image_path.name}: {error}")
+                if consecutive_failures >= Config.MAX_CONSECUTIVE_FAILURES:
+                    self._emit(
+                        "error",
+                        f"Stopping: {consecutive_failures} consecutive failures. "
+                        "Check that the server is running and the model supports vision.",
+                    )
+                    break
+
+        self._emit(
+            "info",
+            f"Done. Renamed: {success_count}, Failed: {failure_count}",
+        )
+        return success_count, failure_count
+
+    def move_to_output(self, dry_run: bool = False) -> MoveResult:
+        """
+        Move all session-renamed files to output_folder.
+
+        No-op if output_folder is empty or dry_run is True (logs intent only).
+
+        Returns:
+            MoveResult with counts of moved, skipped, and any error messages.
+        """
+        if not self.output_folder:
+            self._emit("info", "No output folder configured — skipping move")
+            return MoveResult(moved=0, skipped=len(self._renamed_files))
+
+        output_path = Path(self.output_folder)
+        if not dry_run:
+            output_path.mkdir(parents=True, exist_ok=True)
+
+        moved = 0
+        skipped = 0
+        errors: List[str] = []
+
+        for file_path in self._renamed_files:
+            if not file_path.exists():
+                skipped += 1
+                continue
+
+            dest_filename = self.resolve_filename_conflict(file_path.name, output_path)
+            dest = output_path / dest_filename
+
+            if dry_run:
+                self._emit("info", f"[DRY RUN] Would move: {file_path.name} -> {dest}")
+                skipped += 1
+                continue
+
+            try:
+                file_path.rename(dest)
+                moved += 1
+                self._emit("success", f"Moved: {file_path.name} -> {dest_filename}")
+            except Exception as e:
+                errors.append(f"{file_path.name}: {e}")
+                self._emit("error", f"Failed to move {file_path.name}: {e}")
+
+        return MoveResult(moved=moved, skipped=skipped, errors=errors)
