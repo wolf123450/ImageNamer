@@ -17,44 +17,33 @@ from image_processor import ImageProcessor
 from ollama_client import OllamaClient, OllamaConnectionError
 
 
-# Configure logging
 def setup_logging() -> None:
     """Set up dual logging: file and console."""
     Config.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Create logger
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
-    # File handler (detailed)
     file_handler = logging.FileHandler(Config.LOG_FILE, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
-    file_handler.setFormatter(file_formatter)
 
-    # Console handler (less verbose)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter("%(levelname)s: %(message)s")
-    console_handler.setFormatter(console_formatter)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
 
 def main() -> int:
-    """
-    Main entry point.
-
-    Returns:
-        Exit code (0 for success, non-zero for failure).
-    """
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(
-        description="Rename images based on AI-powered content recognition using Ollama"
+        description="Rename images using AI vision via llama-server / llama-swap"
     )
     parser.add_argument(
         "--dry-run",
@@ -71,18 +60,31 @@ def main() -> int:
         type=str,
         help="Path to image folder (overrides IMAGE_FOLDER env var)",
     )
+    parser.add_argument(
+        "--input-folder",
+        type=str,
+        help="Folder to scan for images (overrides INPUT_FOLDER env var)",
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=str,
+        help="Folder to move renamed images to (overrides OUTPUT_FOLDER env var)",
+    )
+    parser.add_argument(
+        "--move-after",
+        action="store_true",
+        help="Move renamed images to output folder after processing",
+    )
 
     args = parser.parse_args()
-
-    # Setup logging
     setup_logging()
     logger = logging.getLogger(__name__)
 
     logger.info("=" * 60)
     logger.info("ImageNamer started")
-    logger.info(f"Ollama URL: {Config.OLLAMA_BASE_URL}")
-    logger.info(f"Ollama Model: {Config.OLLAMA_MODEL}")
-    logger.info(f"Image Folder: {Config.IMAGE_FOLDER}")
+    logger.info(f"Server URL: {Config.LLAMA_BASE_URL}")
+    logger.info(f"Model: {Config.LLAMA_MODEL}")
+    logger.info(f"Input Folder: {Config.INPUT_FOLDER}")
     logger.info(f"Max Consecutive Failures: {Config.MAX_CONSECUTIVE_FAILURES}")
     if args.dry_run:
         logger.info("MODE: DRY RUN (no files will be modified)")
@@ -90,36 +92,36 @@ def main() -> int:
         logger.info("MODE: RETRY FAILURES")
     logger.info("=" * 60)
 
-    # Override configuration if provided
+    # Apply CLI overrides
     if args.image_folder:
         Config.IMAGE_FOLDER = args.image_folder
+    if args.input_folder:
+        Config.INPUT_FOLDER = args.input_folder
+    if args.output_folder:
+        Config.OUTPUT_FOLDER = args.output_folder
 
-    # Validate configuration
     try:
         Config.validate()
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         return 1
 
-    # Initialize components
     try:
         ollama_client = OllamaClient()
         ollama_client.validate_connection()
     except OllamaConnectionError as e:
-        logger.error(f"Failed to connect to Ollama: {e}")
+        logger.error(f"Failed to connect to server: {e}")
         return 1
 
     processor = ImageProcessor(ollama_client)
     failure_log = FailureLog()
 
-    # Determine images to process
     if args.retry_failures:
         pending_failures = failure_log.get_pending_failures()
         if not pending_failures:
             logger.info("No pending failures to retry")
             return 0
-
-        image_paths = [Path(Config.IMAGE_FOLDER) / filename for filename in pending_failures]
+        image_paths = [Path(Config.INPUT_FOLDER) / filename for filename in pending_failures]
         logger.info(f"Retrying {len(image_paths)} previously failed images")
     else:
         image_paths = processor.discover_images()
@@ -127,15 +129,12 @@ def main() -> int:
             logger.warning("No images found to process")
             return 0
 
-    # Process images
     success_count = 0
-    skipped_count = 0
     consecutive_failures = 0
     persistent_failures = []
 
     for idx, image_path in enumerate(image_paths, 1):
         logger.info(f"Processing {idx}/{len(image_paths)}: {image_path.name}")
-
         success, new_filename, error = processor.process_image(
             image_path, dry_run=args.dry_run
         )
@@ -148,35 +147,39 @@ def main() -> int:
             consecutive_failures += 1
             failure_log.log_failure(image_path.name, error, retry_count=0)
             persistent_failures.append((image_path.name, error))
-
             logger.warning(
                 f"Failed to process {image_path.name}: {error} "
                 f"({consecutive_failures}/{Config.MAX_CONSECUTIVE_FAILURES})"
             )
-
             if consecutive_failures >= Config.MAX_CONSECUTIVE_FAILURES:
                 logger.critical(
-                    f"Aborting: {Config.MAX_CONSECUTIVE_FAILURES} consecutive failures detected. "
-                    "This likely indicates Ollama is down or the model is broken."
+                    f"Aborting: {Config.MAX_CONSECUTIVE_FAILURES} consecutive failures detected."
                 )
                 break
 
-    # Print summary
+    # Optional: move renamed files to output folder
+    if args.move_after and not args.dry_run:
+        if Config.OUTPUT_FOLDER:
+            move_result = processor.move_to_output()
+            logger.info(
+                f"Move complete — moved: {move_result.moved}, skipped: {move_result.skipped}"
+            )
+            for err in move_result.errors:
+                logger.warning(f"Move error: {err}")
+        else:
+            logger.warning("--move-after specified but OUTPUT_FOLDER is not set; skipping")
+
     logger.info("=" * 60)
     logger.info("Processing Summary:")
     logger.info(f"  Successfully processed: {success_count}")
     logger.info(f"  Failed (logged for retry): {len(persistent_failures)}")
-    logger.info(f"  Total processed: {success_count + len(persistent_failures)}")
-
     if persistent_failures:
         logger.warning("Failed images (use --retry-failures to retry):")
         for filename, error in persistent_failures:
             logger.warning(f"  - {filename}: {error}")
-
     if args.dry_run:
-        logger.info("DRY RUN completed - no files were modified")
-
-    logger.info(f"Full log available at: {Config.LOG_FILE}")
+        logger.info("DRY RUN completed — no files were modified")
+    logger.info(f"Full log: {Config.LOG_FILE}")
     logger.info("=" * 60)
 
     return 0 if consecutive_failures < Config.MAX_CONSECUTIVE_FAILURES else 1
