@@ -25,6 +25,20 @@ class Config:
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3-vl:30b")
     OLLAMA_TIMEOUT: int = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
+    # llama-server / llama-swap configuration
+    LLAMA_BASE_URL: str = os.getenv("LLAMA_BASE_URL", "http://localhost:8080")
+    LLAMA_MODEL: str = os.getenv("LLAMA_MODEL", "qwen3-vl-8b")
+    LLAMA_TIMEOUT: int = int(os.getenv("OLLAMA_TIMEOUT", "120"))  # reuses OLLAMA_TIMEOUT env var
+
+    # Input/output directory configuration
+    INPUT_FOLDER: str = os.getenv("INPUT_FOLDER") or os.getenv(
+        "IMAGE_FOLDER", str(Path.home() / "Pictures")
+    )
+    OUTPUT_FOLDER: str = os.getenv("OUTPUT_FOLDER", "")
+
+    # UI configuration
+    UI_THEME: str = os.getenv("UI_THEME", "system")
+
     # Image processing configuration
     IMAGE_FOLDER: str = os.getenv("IMAGE_FOLDER", str(Path.home() / "Pictures"))
     SUPPORTED_FORMATS: Set[str] = {"jpg", "jpeg", "png", "webp"}
