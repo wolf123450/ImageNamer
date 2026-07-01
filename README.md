@@ -10,6 +10,27 @@ them to descriptive filenames like `landscape-sunset-over-mountains.jpg`.
   [llama-server](https://github.com/ggerganov/llama.cpp) running locally
   with a vision-capable model loaded
 
+## Starting the inference server
+
+**llama-server** (single model — Qwen3-VL-8B, your model is in the HuggingFace cache):
+```powershell
+$qwen = "$env:USERPROFILE\.cache\huggingface\hub\models--unsloth--Qwen3-VL-8B-Instruct-GGUF\snapshots\b93a7ee713758252c555be4210c00540df954dc2"
+llama-server -m "$qwen\Qwen3-VL-8B-Instruct-Q4_K_M.gguf" --mmproj "$qwen\mmproj-BF16.gguf" --port 8080 --n-gpu-layers 99
+```
+
+Or with Gemma4-E4B:
+```powershell
+$gemma = "$env:USERPROFILE\.cache\huggingface\hub\models--unsloth--gemma-4-E4B-it-GGUF\snapshots\ce152932ac27bc40bc9c727386760424d50bb456"
+llama-server -m "$gemma\gemma-4-E4B-it-Q4_K_M.gguf" --mmproj "$gemma\mmproj-BF16.gguf" --port 8080 --n-gpu-layers 99
+```
+
+**llama-swap** (multi-model, loads on demand — recommended):
+```powershell
+llama-swap --config C:\models\swap.yaml
+```
+
+The app expects the server at `http://localhost:8080` by default (override with `LLAMA_BASE_URL` in `.env`).
+
 ## Setup
 
 ```powershell
