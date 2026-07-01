@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+import webview
 from nicegui import app, run, ui
 
 from config import Config
@@ -41,20 +42,31 @@ class ImageNamerUI:
         self._status_label = None
         self._input_input = None
         self._output_input = None
+        self._dark_mode = None
 
     def build(self) -> None:
         """Register static files, inject CSS, and define the page layout."""
         app.add_static_files("/styles", str(Path(__file__).parent / "styles"))
-        ui.add_head_html('<link rel="stylesheet" href="/styles/app.css">')
 
         @ui.page("/")
         async def index():
+            ui.add_head_html('<link rel="stylesheet" href="/styles/app.css">')
             await self._render()
-            await self._load_models()
-            await self._check_connection()
+            # Schedule network calls as background tasks so the page renders
+            # immediately and doesn't hit NiceGUI's 3-second render timeout.
+            asyncio.ensure_future(self._load_models())
+            asyncio.ensure_future(self._check_connection())
 
     async def _render(self) -> None:
         """Render the full page layout."""
+        self._dark_mode = ui.dark_mode()
+        # Apply saved theme immediately
+        if Config.UI_THEME == "dark":
+            self._dark_mode.enable()
+        elif Config.UI_THEME == "light":
+            self._dark_mode.disable()
+        else:
+            self._dark_mode.auto()
         with ui.row().classes("w-full gap-4 p-4"):
             # ── LEFT PANEL (controls) ────────────────────────────────
             with ui.column().classes("flex-1 gap-3 imagenamer-panel"):
@@ -103,16 +115,16 @@ class ImageNamerUI:
                 with ui.row().classes("gap-2"):
                     self._run_btn = ui.button(
                         "▶ Run",
-                        on_click=lambda: asyncio.ensure_future(self._run(dry_run=False)),
+                        on_click=lambda: self._run(dry_run=False),
                     ).props("color=primary")
                     self._dry_run_btn = ui.button(
                         "Dry-run",
-                        on_click=lambda: asyncio.ensure_future(self._run(dry_run=True)),
+                        on_click=lambda: self._run(dry_run=True),
                     ).props("outline")
                     self._move_btn = (
                         ui.button(
                             "Move →",
-                            on_click=lambda: asyncio.ensure_future(self._move()),
+                            on_click=lambda: self._move(),
                         )
                         .props("outline")
                         .set_enabled(False)
@@ -147,9 +159,7 @@ class ImageNamerUI:
                     for theme in ("Dark", "Light", "System"):
                         ui.button(
                             theme,
-                            on_click=lambda t=theme: asyncio.ensure_future(
-                                self._set_theme(t.lower())
-                            ),
+                            on_click=lambda t=theme: self._set_theme(t.lower()),
                         ).classes("theme-pill").props("flat dense")
 
                 # Max failures
@@ -182,28 +192,44 @@ class ImageNamerUI:
         self.client = LlamaClient(base_url=value, model=self.selected_model)
 
     async def _pick_input_folder(self) -> None:
-        result = await ui.run_javascript(
-            "window.showDirectoryPicker ? window.showDirectoryPicker().then(d => d.name) : null"
+        result = await app.native.main_window.create_file_dialog(
+            webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG,
+            directory=str(Path(Config.INPUT_FOLDER).expanduser()) if Config.INPUT_FOLDER else str(Path.home()),
         )
-        # Folder picker via JS is limited in native mode; keep the text input as primary
+        if result:
+            folder = result[0]
+            if self._input_input:
+                self._input_input.value = folder
+            self._on_input_folder_change(folder)
 
     async def _pick_output_folder(self) -> None:
-        pass  # Same note as above; text input is primary
+        result = await app.native.main_window.create_file_dialog(
+            webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG,
+            directory=str(Path(Config.OUTPUT_FOLDER).expanduser()) if Config.OUTPUT_FOLDER else str(Path.home()),
+        )
+        if result:
+            folder = result[0]
+            if self._output_input:
+                self._output_input.value = folder
+            self._on_output_folder_change(folder)
 
     async def _load_models(self) -> None:
         try:
-            self.models = await run.io_bound(self.client.list_models)
+            models = await run.io_bound(self.client.list_models)
+            self.models = models or []
             options = [build_model_label(m) for m in self.models]
             if self._model_select:
                 self._model_select.options = options
                 # Keep current selection if still available, else default to first
                 current_labels = [build_model_label(m) for m in self.models if m.id == self.selected_model]
                 self._model_select.value = current_labels[0] if current_labels else (options[0] if options else "")
-        except LlamaConnectionError:
-            # Keep the config default visible in the dropdown
+        except Exception:
+            # Server unreachable — keep the config default visible in the dropdown
+            self.models = []
             if self._model_select:
                 self._model_select.options = [self.selected_model]
-            ui.notify("Cannot reach llama server — using config default model", type="warning")
+            # Avoid ui.notify here — it requires slot context which background tasks lack
+            self._push_log("warning", "Cannot reach llama server — using config default model")
 
     async def _refresh_models(self) -> None:
         await self._load_models()
@@ -213,7 +239,7 @@ class ImageNamerUI:
         try:
             await run.io_bound(self.client.validate_connection)
             html = '<span class="status-dot connected"></span> Connected'
-        except LlamaConnectionError:
+        except Exception:
             html = f'<span class="status-dot disconnected"></span> Disconnected ({Config.LLAMA_BASE_URL})'
         if self._status_label:
             self._status_label.set_content(html)
@@ -302,9 +328,15 @@ class ImageNamerUI:
         """Apply theme by setting data-theme attribute and persisting to config."""
         Config.UI_THEME = theme
         if theme == "dark":
+            if self._dark_mode:
+                self._dark_mode.enable()
             js = "document.documentElement.setAttribute('data-theme', 'dark')"
         elif theme == "light":
+            if self._dark_mode:
+                self._dark_mode.disable()
             js = "document.documentElement.setAttribute('data-theme', 'light')"
         else:
+            if self._dark_mode:
+                self._dark_mode.auto()
             js = "document.documentElement.removeAttribute('data-theme')"
         await ui.run_javascript(js)
